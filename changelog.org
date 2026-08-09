@@ -4,6 +4,30 @@
 
 All notable changes to this project will be documented in this file.
 
+* [0.7.0] - 2026-08-09
+
+** Added
+- Explicit mode flags: ~-o~ / ~--open~, ~-r~ / ~--read~, ~-w~ / ~--write~ - they override all detection heuristics
+- Open mode accepts multiple paths and opens them all with a single ~emacsclient~ call: ~mxp --open a.org "b with spaces.org" src/~
+- ~rg -l0 pat | xargs -0 mxp --open~ and ~find . -name '*.org' -exec mxp --open {} +~ now work: non-tty stdin no longer forces write mode when the arguments are existing paths
+- ~--~ terminator for filenames that start with a dash
+- Open-mode error policy: missing paths are reported to stderr, the remaining paths still open, exit code is 1
+- ~MXP_UPDATE_URL~ env var overriding the self-update source (primarily a test seam - the update path is now covered by hermetic ~file://~ tests, including symlink resolution)
+
+** Changed
+- *BREAKING*: mode detection consults the filesystem before stdin - piping into ~mxp <arg>~ where ~<arg>~ is an existing file or directory now opens it instead of writing to a buffer by that name; use ~-w~ for the old behavior. Non-existing names keep their old meaning (buffer name or regex), so piped regex targets like ~".*log.*"~ still work
+- *BREAKING*: open mode is silent on success (was: one "Opened file in Emacs: ..." line per path on stdout)
+- Multiple positional arguments now open (when they all exist) or error out demanding an explicit mode flag - previously all but the last were silently dropped
+- ~-f~ / ~--from~ and ~-s~ / ~--socket-name~ without an operand die with a usage error instead of a bash unbound-variable trace
+- ~--update~ refuses to install a remote version older than the local one (previously any version difference installed, including downgrades) and rejects malformed remote version strings
+
+** Fixed
+- Non-interactive callers (~xargs~, ~find -exec~, ~make~, cron, CI) no longer fall into write mode and litter Emacs with empty junk buffers named after files - or, with ~-F~, erase a file's unsaved buffer
+- Opening a relative path under a nonexistent directory reports a proper error instead of dying silently
+- Filenames starting with a dash no longer confuse ~dirname~ / ~basename~ / ~emacsclient~ in open mode
+- Read mode no longer clobbers the socket-disconnect EXIT trap (the temp-file cleanup trap now chains it)
+- Open-mode test coverage: the previous suite skipped open mode entirely ("requires interactive terminal"), which is how the mode-detection defect shipped; tty-dependent detection is now tested against a pty via ~script(1)~
+
 * [0.6.0] - 2026-04-06
 
 ** Added

@@ -6,12 +6,14 @@
 
 set -euo pipefail
 
-VERSION="0.5.3"
+VERSION="0.7.0"
 CHUNK_SIZE=100
 STREAM_TIMEOUT=0.3
 MXP_PORT="${MXP_PORT:-17394}"
 MXP_SOCK_FD=""
 EMACS_SOCKET_NAME="${EMACS_SOCKET_NAME:-}"
+# Overridable so the self-update path is testable against a file:// fake
+MXP_UPDATE_URL="${MXP_UPDATE_URL:-https://raw.githubusercontent.com/agzam/mxp/main/mxp}"
 
 usage() {
   cat << EOF
@@ -25,10 +27,14 @@ USAGE:
   mxp --from BUFFER-NAME [OPTIONS]
   mxp -f BUFFER-NAME [OPTIONS]
   
-  # Open file or directory in Emacs
-  mxp FILE-OR-DIRECTORY
+  # Open files or directories in Emacs
+  mxp [--open] PATH [PATH...]
 
 OPTIONS:
+  -o, --open            Open the given paths in Emacs (files or directories)
+  -r, --read            Read matching buffer to stdout (positional arg is the
+                        buffer name or regex; same as --from)
+  -w, --write           Write stdin to buffer, even if its name looks like a path
   -f, --from BUFFER     Read from buffer (name or regex) and output to stdout
   -a, --append          Append to buffer instead of replacing content
   -p, --prepend         Prepend to buffer (insert at the beginning)
@@ -36,6 +42,7 @@ OPTIONS:
   -F, --force           Overwrite existing buffer (skip conflict resolution)
   -h, --help            Show this help message
   -v, --version         Show version
+  --                    Treat everything after as paths/names (e.g. -weird.txt)
   --update              Update mxp to the latest version from GitHub
 
 EXAMPLES:
@@ -68,11 +75,24 @@ EXAMPLES:
   mxp .
   mxp ~/Projects
   mxp /path/to/file
+  mxp --open "file with spaces.org" other.org src/
+
+  # Open every file matching a search - any count, any filenames
+  rg -l0 "TODO" | xargs -0 mxp --open
+  find . -name '*.org' -exec mxp --open {} +
 
 NOTES:
-  - Smart detection: automatically detects files/directories vs buffer names
-    - Paths with /, ~, . or existing on filesystem → open in Emacs
-    - Everything else → treated as buffer name
+  - Mode selection, in order:
+    1. Explicit flags (-o/--open, -r/--read, -w/--write, -f/--from) always win
+    2. Arguments that all exist on the filesystem → open in Emacs,
+       piped stdin or not (this is what makes xargs/find -exec work)
+    3. On a terminal: path-shaped arguments (start with /, ~, . or
+       contain /) → open; a bare word → read that buffer
+    4. Otherwise piped stdin writes to the buffer (names that merely
+       look like paths, e.g. regexes like ".*log.*", still work)
+  - Use -w to write to a buffer named like an existing path
+  - Open mode is silent on success and reports missing paths to stderr
+    (other given paths still open; exit code is 1)
   - Buffer names support regex patterns for matching
   - Auto-generates buffer names like "*Piper 1*" when none specified
   - Hook: Define 'mxp-buffer-hook' in Emacs to run on buffer creation
@@ -120,14 +140,35 @@ find_script_location() {
   fi
   
   # Last resort: use cd/pwd trick
-  local dir=$(dirname "$script")
-  local base=$(basename "$script")
+  local dir base
+  dir=$(dirname "$script")
+  base=$(basename "$script")
   (cd "$dir" && echo "$(pwd)/$base")
+}
+
+# Numeric x.y.z comparison; true when $1 is strictly older than $2
+version_lt() {
+  local IFS=.
+  local -a a b
+  read -r -a a <<< "$1"
+  read -r -a b <<< "$2"
+  local i x y
+  for i in 0 1 2; do
+    x="${a[i]:-0}"
+    y="${b[i]:-0}"
+    if [ "$x" -lt "$y" ]; then
+      return 0
+    fi
+    if [ "$x" -gt "$y" ]; then
+      return 1
+    fi
+  done
+  return 1
 }
 
 # Check for updates by comparing local and remote versions
 check_for_updates() {
-  local remote_url="https://raw.githubusercontent.com/agzam/mxp/main/mxp"
+  local remote_url="$MXP_UPDATE_URL"
   
   echo "Checking for updates..." >&2
   
@@ -151,7 +192,7 @@ self_update() {
     die "Cannot write to $script_path. Try running with sudo or check permissions."
   fi
   
-  local remote_url="https://raw.githubusercontent.com/agzam/mxp/main/mxp"
+  local remote_url="$MXP_UPDATE_URL"
   local temp_file
   temp_file=$(mktemp)
   
@@ -178,10 +219,24 @@ self_update() {
     die "Could not determine version of downloaded file"
   fi
   
+  if ! [[ "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    rm -f "$temp_file"
+    die "Unexpected remote version format: $new_version"
+  fi
+
   # Check if already up to date
   if [ "$new_version" = "$VERSION" ]; then
     rm -f "$temp_file"
     echo "Already up to date (v${VERSION})"
+    exit 0
+  fi
+
+  # A local version ahead of the remote happens between a release being
+  # prepared and it landing on main - clobbering it helps nobody
+  if version_lt "$new_version" "$VERSION"; then
+    rm -f "$temp_file"
+    echo "Remote version (v${new_version}) is older than local (v${VERSION}) - not downgrading."
+    echo "To force it, download manually from: $MXP_UPDATE_URL"
     exit 0
   fi
   
@@ -448,8 +503,12 @@ read_mode() {
   local temp_file
   temp_file=$(mktemp)
   
-  # Ensure cleanup on exit/interrupt
-  trap "rm -f '$temp_file'" EXIT INT TERM
+  # Ensure cleanup on exit/interrupt, chaining the socket disconnect this
+  # trap would otherwise clobber (main registered it on EXIT before us).
+  # Immediate expansion is deliberate: temp_file is a local, gone by the
+  # time the EXIT trap fires
+  # shellcheck disable=SC2064
+  trap "rm -f '$temp_file'; mxp_disconnect" EXIT INT TERM
   
   # Write buffer to temp file with explicit UTF-8 encoding to avoid prompts
   if ! emacs_eval "(let ((coding-system-for-write 'utf-8))
@@ -462,34 +521,49 @@ read_mode() {
   cat "$temp_file"
 }
 
-# Open mode: open file or directory in Emacs
+# Open mode: open files and directories in Emacs.
+# All paths go to a single emacsclient call - one server round-trip no
+# matter how many files xargs hands us. Missing paths are reported to
+# stderr, the existing ones still open, exit is nonzero if any were
+# missing (lists from rg/find can race against deletion; losing the
+# whole batch to one stale entry helps nobody). Success is silent - the
+# files appearing in Emacs is the feedback.
 open_mode() {
-  local path="$1"
-  
-  # Expand ~ to home directory if needed
-  if [[ "$path" == "~"* ]]; then
-    path="${path/#\~/$HOME}"
+  local -a paths=()
+  local -a missing=()
+  local path dir
+
+  for path in "$@"; do
+    # Expand ~ to home directory if needed
+    if [[ "$path" == "~"* ]]; then
+      path="${path/#\~/$HOME}"
+    fi
+    # Convert to absolute path (an unresolvable parent directory means
+    # the path cannot exist - leave it for the missing report below).
+    # The -- guards keep leading-dash filenames from reading as options.
+    if [[ "$path" != /* ]]; then
+      if dir=$(cd -- "$(dirname -- "$path")" 2>/dev/null && pwd); then
+        path="${dir%/}/$(basename -- "$path")"
+      fi
+    fi
+    if [ -e "$path" ]; then
+      paths+=("$path")
+    else
+      missing+=("$path")
+    fi
+  done
+
+  for path in ${missing[@]+"${missing[@]}"}; do
+    echo "Error: path does not exist: $path (use -w to pipe into a buffer by that name)" >&2
+  done
+
+  if [ "${#paths[@]}" -gt 0 ]; then
+    # emacsclient -n handles frame management and interactive prompts
+    # correctly, unlike find-file from a process filter context
+    run_emacsclient -n "${paths[@]}" &>/dev/null || die "Failed to open in Emacs"
   fi
-  
-  # Convert to absolute path
-  if [[ "$path" != /* ]]; then
-    path="$(cd "$(dirname "$path")" 2>/dev/null && pwd)/$(basename "$path")"
-  fi
-  
-  # Check if path exists
-  if [ ! -e "$path" ]; then
-    die "Path does not exist: $path"
-  fi
-  
-  # Open in Emacs (emacsclient -n handles frame management and interactive prompts
-  # correctly, unlike find-file from a process filter context)
-  if [ -d "$path" ]; then
-    run_emacsclient -n "$path" &>/dev/null || die "Failed to open '$path'"
-    echo "Opened directory in Emacs: $path"
-  else
-    run_emacsclient -n "$path" &>/dev/null || die "Failed to open '$path'"
-    echo "Opened file in Emacs: $path"
-  fi
+
+  [ "${#missing[@]}" -eq 0 ]
 }
 
 # Write mode: pipe stdin to buffer
@@ -615,12 +689,22 @@ write_mode() {
   mxp_disconnect
 }
 main() {
-  local mode="write"
+  local mode=""
   local buffer_pattern=""
   local append="false"
   local prepend="false"
   local force="false"
-  
+  local -a positionals=()
+
+  # Explicit mode flags override every heuristic; two different ones is
+  # user confusion - refuse rather than pick a winner
+  set_explicit_mode() {
+    if [ -n "$mode" ] && [ "$mode" != "$1" ]; then
+      die "Conflicting mode flags: --${mode} and --${1}"
+    fi
+    mode="$1"
+  }
+
   # Parse arguments
   while [[ $# -gt 0 ]]; do
     case $1 in
@@ -635,8 +719,18 @@ main() {
         self_update
         exit 0
         ;;
+      -o|--open)
+        set_explicit_mode "open"
+        ;;
+      -r|--read)
+        set_explicit_mode "read"
+        ;;
+      -w|--write)
+        set_explicit_mode "write"
+        ;;
       -f|--from)
-        mode="read"
+        [ $# -ge 2 ] || die "Option $1 requires an argument"
+        set_explicit_mode "read"
         shift
         buffer_pattern="$1"
         ;;
@@ -647,41 +741,96 @@ main() {
         prepend="true"
         ;;
       -s|--socket-name)
+        [ $# -ge 2 ] || die "Option $1 requires an argument"
         shift
         EMACS_SOCKET_NAME="$1"
         ;;
       -F|--force)
         force="true"
         ;;
+      --)
+        # Everything after -- is positional (filenames starting with -)
+        shift
+        while [ $# -gt 0 ]; do
+          positionals+=("$1")
+          shift
+        done
+        break
+        ;;
       -*)
         die "Unknown option: $1"
         ;;
       *)
-        buffer_pattern="$1"
+        positionals+=("$1")
         ;;
     esac
     shift
   done
-  
-  # Determine mode if not explicitly set
-  # Check if stdin is a terminal (interactive use, no pipe)
-  if [ "$mode" = "write" ] && [ -t 0 ]; then
-    # No stdin pipe - check what the argument is
-    if [ -n "$buffer_pattern" ]; then
-      # Check if it's a file/directory path or buffer name
-      if is_path "$buffer_pattern"; then
+
+  local npos="${#positionals[@]}"
+
+  # Infer mode when no explicit flag was given. Existence on disk is
+  # checked before stdin: whether stdin is a tty is an artifact of the
+  # caller (xargs, find -exec, make, CI all provide non-tty stdin), so
+  # arguments that resolve to existing paths are the stronger signal of
+  # intent. Merely path-SHAPED arguments keep their old meaning: open
+  # intent on a terminal, buffer name/regex (".*log.*") when piped.
+  if [ -z "$mode" ]; then
+    if [ "$npos" -gt 0 ]; then
+      local all_exist="true"
+      local p q
+      for p in "${positionals[@]}"; do
+        q="$p"
+        if [[ "$q" == "~"* ]]; then
+          q="${q/#\~/$HOME}"
+        fi
+        if [ ! -e "$q" ]; then
+          all_exist="false"
+        fi
+      done
+      if [ "$all_exist" = "true" ]; then
         mode="open"
+      elif [ -t 0 ]; then
+        local all_shaped="true"
+        for p in "${positionals[@]}"; do
+          is_path "$p" || all_shaped="false"
+        done
+        if [ "$all_shaped" = "true" ]; then
+          # open_mode reports the missing ones and exits nonzero
+          mode="open"
+        elif [ "$npos" -gt 1 ]; then
+          die "Multiple arguments given but not all are existing paths. Use -o/--open, -w/--write, or -r/--read to disambiguate."
+        else
+          mode="read"
+        fi
+      elif [ "$npos" -eq 1 ]; then
+        mode="write"
       else
-        mode="read"
+        die "Multiple arguments given but not all are existing paths. Use -o/--open, -w/--write, or -r/--read to disambiguate."
       fi
+    elif [ ! -t 0 ]; then
+      mode="write"
     else
       die "No input provided. Use --help for usage."
     fi
   fi
-  
+
   # Validate flags
   if [ "$append" = "true" ] && [ "$prepend" = "true" ]; then
     die "Cannot use both --append and --prepend"
+  fi
+
+  # Read and write operate on exactly one buffer
+  if [ "$mode" = "read" ] || [ "$mode" = "write" ]; then
+    if [ "$npos" -gt 1 ]; then
+      die "${mode} mode takes a single buffer name or pattern"
+    fi
+    if [ "$npos" -eq 1 ]; then
+      if [ -n "$buffer_pattern" ]; then
+        die "${mode} mode takes a single buffer name or pattern"
+      fi
+      buffer_pattern="${positionals[0]}"
+    fi
   fi
 
   # Initialize connection to Emacs (socket with emacsclient fallback)
@@ -695,7 +844,10 @@ main() {
     fi
     read_mode "$buffer_pattern"
   elif [ "$mode" = "open" ]; then
-    open_mode "$buffer_pattern"
+    if [ "$npos" -eq 0 ]; then
+      die "Open mode requires at least one file or directory path"
+    fi
+    open_mode "${positionals[@]}"
   else
     write_mode "$buffer_pattern" "$append" "$prepend" "$force"
   fi
