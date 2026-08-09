@@ -61,7 +61,7 @@ Examples:
   $0 --only=core,read   # Run only core and read tests
   $0 --skip=unicode     # Skip unicode tests
 
-Available tags: core, read, write, regex, large, unicode, terminal, cleanup
+Available tags: core, read, write, regex, open, socket, large, unicode, terminal, cleanup
 EOF
       exit 0
       ;;
@@ -156,6 +156,84 @@ buffer_content() {
   # Use mxp's own read mode instead of parsing elisp strings
   ./mxp --from "$buffer" 2>/dev/null
 }
+
+# --- Open-mode helpers ---
+
+# Absolute script path: open-mode tests cd into temp dirs and xargs
+# needs a stable command path
+SCRIPT_ABS="$(pwd)/mxp"
+
+# Physical (symlink-free) root for open-mode test files. Emacs reports
+# truename paths back (macOS /tmp is a symlink), so tests must compare
+# against physical paths. Created lazily - stays empty when open tests
+# are filtered out.
+OPEN_TEST_DIR=""
+
+ensure_open_test_dir() {
+  if [ -z "$OPEN_TEST_DIR" ]; then
+    OPEN_TEST_DIR=$(mktemp -d /tmp/mxp-open-test.XXXXXX)
+    OPEN_TEST_DIR=$(cd "$OPEN_TEST_DIR" && pwd -P)
+  fi
+}
+
+# Scratch dir for the hermetic self-update tests (fake file:// remotes)
+UPD_TEST_DIR=""
+
+file_buffer_exists() {
+  local f="$1"
+  local cmd
+  # find-buffer-visiting (not get-file-buffer): it matches through
+  # truename resolution, which emacsclient applies to visited paths
+  cmd=$(printf '(and (find-buffer-visiting "%s") t)' "$f")
+  emacsclient --eval "$cmd" 2>/dev/null | grep -q '^t$'
+}
+
+dired_buffer_exists() {
+  local d="$1"
+  emacsclient --eval "(progn (require 'dired) (and (dired-buffers-for-dir \"$d/\") t))" 2>/dev/null | grep -q '^t$'
+}
+
+# Run a command with a real tty on stdin (mode auto-detection tests).
+# The session transcript is read from script(1)'s typescript file, not
+# from its stdout pipe: under load macOS script can drop output the
+# child writes right before exiting, but the file is always flushed.
+# Output contains pty artifacts (\r, ^D echo) - match by substring only.
+run_on_tty() {
+  local transcript
+  transcript=$(mktemp)
+  script -q "$transcript" "$@" </dev/null >/dev/null 2>&1 || true
+  tr -d '\r' < "$transcript"
+  rm -f "$transcript"
+}
+
+# Suite-wide cleanup, registered as EXIT trap so it runs even when the
+# suite aborts mid-way. Kills only buffers the suite owns: everything
+# visiting a file (or dired-ing a dir) under OPEN_TEST_DIR, plus the
+# exact write-mode buffer names the tests create (and their <N> clones,
+# which otherwise accumulate in the daemon run after run).
+cleanup_all_tests() {
+  if [ -n "$OPEN_TEST_DIR" ] && [ -d "$OPEN_TEST_DIR" ]; then
+    emacsclient --eval "(let ((kill-buffer-query-functions nil))
+      (dolist (b (buffer-list))
+        (let ((f (buffer-file-name b))
+              (d (buffer-local-value 'default-directory b))
+              (mm (buffer-local-value 'major-mode b)))
+          (when (or (and f (string-prefix-p \"$OPEN_TEST_DIR/\" f))
+                    (and (provided-mode-derived-p mm 'dired-mode)
+                         (string-prefix-p \"$OPEN_TEST_DIR/\" d)))
+            (kill-buffer b)))))" &>/dev/null || true
+    rm -rf "$OPEN_TEST_DIR" 2>/dev/null || true
+  fi
+  emacsclient --eval '(let ((kill-buffer-query-functions nil))
+    (dolist (b (buffer-list))
+      (when (string-match-p "^\\*\\(test-\\(buffer\\|append\\|prepend\\|conflict\\|force\\|read\\|nopassthrough\\|multiline\\|special\\|empty\\|large\\|autoread\\|socket-boot\\|socket-rt\\|socket-stream\\|fallback\\|fallback-stream\\|idemp-alpha\\|idemp-beta\\|custom-port\\|socket-name-flag\\|socket-name-env\\|socket-name-long\\)\\|my-test-buffer\\|regex-test-123\\|large-buffer-test\\|unicode-test\\|complete-hook-test\\|update-hook-test\\|Piper [12]\\)\\*\\(<[0-9]+>\\)?$" (buffer-name b))
+        (kill-buffer b))))' &>/dev/null || true
+  if [ -n "$UPD_TEST_DIR" ]; then
+    rm -rf "$UPD_TEST_DIR" 2>/dev/null || true
+  fi
+  return 0
+}
+trap cleanup_all_tests EXIT
 
 # Pre-test cleanup
 section "Pre-test Cleanup"
@@ -455,39 +533,278 @@ else
   fail "Error message missing for non-existent buffer"
 fi
 
-# Test 20: Read mode without stdin (auto-detect)
-section "Test 15: Auto-detect Read Mode"
-if [ -n "${CI:-}" ]; then
-  info "Skipped in CI (command substitution stdin edge case)"
-else
-  cleanup_buffer "*test-autoread*"
-  echo "auto read test" | $SCRIPT "*test-autoread*" &>/dev/null
-
-  # Call without --from but redirect from /dev/null to simulate no stdin
-  # This simulates terminal usage where stdin is not a pipe
-  output=$($SCRIPT "*test-autoread*" </dev/null 2>/dev/null)
-  if [[ "$output" == *"auto read test"* ]]; then
-    pass "Auto-detects read mode when no stdin"
+# Test 20: Read mode auto-detect needs a real tty (a pty via script(1));
+# with non-tty stdin a buffer-name argument means write mode by design
+section "Test 15: Auto-detect Read Mode (tty)"
+if should_run_test "read,terminal"; then
+  if [ "$LIST_TESTS" = true ]; then
+    echo "  [read,terminal] Auto-detect read mode on tty stdin"
   else
-    fail "Auto-detect read mode failed: got '$output'"
+    cleanup_buffer "*test-autoread*"
+    echo "auto read test" | $SCRIPT "*test-autoread*" &>/dev/null
+
+    output=$(run_on_tty "$SCRIPT" "*test-autoread*" || true)
+    if [[ "$output" == *"auto read test"* ]]; then
+      pass "Auto-detects read mode on tty stdin"
+    else
+      fail "Auto-detect read mode failed: got '$output'"
+    fi
+    cleanup_buffer "*test-autoread*"
   fi
 fi
 
-# Test 21: Open mode - file opening
+# Test 21: Open mode
 section "Test 16: Open Mode - Files and Directories"
-info "Open mode tests require interactive terminal (test manually with: mxp README.org)"
+if should_run_test "open"; then
+  if [ "$LIST_TESTS" = true ]; then
+    echo "  [open] Open mode: explicit flags, multiple paths, xargs, error policy"
+  else
+    ensure_open_test_dir
 
-# Test 22: Smart detection - buffer vs file  
-section "Test 17: Smart Detection"
-# Should read as buffer (doesn't exist as file, no path indicators)
-cleanup_buffer "*my-test-buffer*"
-echo "buffer content" | $SCRIPT "*my-test-buffer*" &>/dev/null
-output=$($SCRIPT "*my-test-buffer*" 2>/dev/null || echo "")
-if [[ "$output" == *"buffer content"* ]]; then
-  pass "Detects buffer name correctly"
-else
-  # In non-terminal environment, this is expected to fail
-  info "Buffer detection test skipped (requires terminal)"
+    # Single file via --open, non-tty stdin (the xargs/find/make context)
+    touch "$OPEN_TEST_DIR/single.txt"
+    if $SCRIPT --open "$OPEN_TEST_DIR/single.txt" </dev/null &&
+        file_buffer_exists "$OPEN_TEST_DIR/single.txt"; then
+      pass "--open opens a file despite non-tty stdin"
+    else
+      fail "--open with non-tty stdin failed"
+    fi
+
+    # Success is silent
+    output=$($SCRIPT --open "$OPEN_TEST_DIR/single.txt" </dev/null 2>&1 || true)
+    if [ -z "$output" ]; then
+      pass "--open is silent on success"
+    else
+      fail "--open produced output on success: '$output'"
+    fi
+
+    # Multiple paths in one invocation: spaces, plain file, directory
+    mkdir "$OPEN_TEST_DIR/sub dir"
+    touch "$OPEN_TEST_DIR/with space.txt" "$OPEN_TEST_DIR/plain.txt"
+    if $SCRIPT -o "$OPEN_TEST_DIR/with space.txt" "$OPEN_TEST_DIR/plain.txt" "$OPEN_TEST_DIR/sub dir" </dev/null &&
+        file_buffer_exists "$OPEN_TEST_DIR/with space.txt" &&
+        file_buffer_exists "$OPEN_TEST_DIR/plain.txt" &&
+        dired_buffer_exists "$OPEN_TEST_DIR/sub dir"; then
+      pass "Multiple paths (spaces, file, dir) open in one invocation"
+    else
+      fail "Multiple-path open failed"
+    fi
+
+    # The motivating pipeline: newline list through xargs
+    touch "$OPEN_TEST_DIR/xa.txt" "$OPEN_TEST_DIR/xb.txt" "$OPEN_TEST_DIR/xc.txt"
+    printf '%s\n' "$OPEN_TEST_DIR/xa.txt" "$OPEN_TEST_DIR/xb.txt" "$OPEN_TEST_DIR/xc.txt" \
+      | xargs "$SCRIPT" --open || true
+    if file_buffer_exists "$OPEN_TEST_DIR/xa.txt" &&
+        file_buffer_exists "$OPEN_TEST_DIR/xb.txt" &&
+        file_buffer_exists "$OPEN_TEST_DIR/xc.txt"; then
+      pass "xargs newline pipeline opens all files"
+    else
+      fail "xargs newline pipeline failed"
+    fi
+
+    # NUL list through xargs -0: space and shell metacharacters in names
+    sp_file="$OPEN_TEST_DIR/nul space file.txt"
+    meta_file="$OPEN_TEST_DIR/meta \$x ;() 'q.txt"
+    touch "$sp_file" "$meta_file"
+    printf '%s\0' "$sp_file" "$meta_file" | xargs -0 "$SCRIPT" --open || true
+    if file_buffer_exists "$sp_file" && file_buffer_exists "$meta_file"; then
+      pass "xargs -0 pipeline survives spaces and metacharacters"
+    else
+      fail "xargs -0 pipeline mangled filenames"
+    fi
+
+    # -- terminator for leading-dash filenames
+    touch "$OPEN_TEST_DIR/-dash.txt"
+    (cd "$OPEN_TEST_DIR" && "$SCRIPT_ABS" --open -- -dash.txt </dev/null) || true
+    if file_buffer_exists "$OPEN_TEST_DIR/-dash.txt"; then
+      pass "-- terminator allows leading-dash filenames"
+    else
+      fail "-- terminator failed"
+    fi
+
+    # Error policy: existing paths open, missing ones reported, exit 1
+    rc=0
+    output=$($SCRIPT --open "$OPEN_TEST_DIR/plain.txt" "$OPEN_TEST_DIR/ghost.txt" </dev/null 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && [[ "$output" == *"ghost.txt"* ]] && [[ "$output" == *"does not exist"* ]]; then
+      pass "Missing path reported to stderr with nonzero exit"
+    else
+      fail "Missing-path policy broken: rc=$rc output='$output'"
+    fi
+  fi
+fi
+
+# Test 22: Regression for the [ -t 0 ] mode-selector defect: non-tty
+# stdin plus a path argument used to fall into write mode and erase or
+# shadow buffers named after the file
+section "Test 16.1: Non-tty Path Regression (junk buffers)"
+if should_run_test "open"; then
+  if [ "$LIST_TESTS" = true ]; then
+    echo "  [open] Non-tty stdin + path arg creates no junk buffer"
+  else
+    ensure_open_test_dir
+
+    # Relative ./-style path: old code created a buffer named "./reg.txt"
+    touch "$OPEN_TEST_DIR/reg.txt"
+    (cd "$OPEN_TEST_DIR" && printf 'piped data\n' | "$SCRIPT_ABS" ./reg.txt) || true
+    junk=$(emacsclient --eval '(and (get-buffer "./reg.txt") t)' 2>/dev/null)
+    if file_buffer_exists "$OPEN_TEST_DIR/reg.txt" && [ "$junk" = "nil" ]; then
+      pass "Piped stdin + ./path opens the file, no junk buffer"
+    else
+      fail "Junk buffer regression (./path): junk=$junk"
+    fi
+
+    # Plain-name path: junk would be a file-less buffer named reg2.txt
+    touch "$OPEN_TEST_DIR/reg2.txt"
+    (cd "$OPEN_TEST_DIR" && printf 'piped data\n' | "$SCRIPT_ABS" reg2.txt) || true
+    junk=$(emacsclient --eval '(let ((b (get-buffer "reg2.txt"))) (if (and b (not (buffer-file-name b))) t nil))' 2>/dev/null)
+    junk2=$(emacsclient --eval '(and (get-buffer "reg2.txt<2>") t)' 2>/dev/null)
+    if file_buffer_exists "$OPEN_TEST_DIR/reg2.txt" && [ "$junk" = "nil" ] && [ "$junk2" = "nil" ]; then
+      pass "Piped stdin + existing filename opens the file, no junk buffer"
+    else
+      fail "Junk buffer regression (plain name): junk=$junk junk2=$junk2"
+    fi
+
+    # -w escape hatch: explicitly write to a buffer named like a path
+    (cd "$OPEN_TEST_DIR" && printf 'buffer not file\n' | "$SCRIPT_ABS" -w ./reg.txt) || true
+    wbuf=$(emacsclient --eval '(let ((b (get-buffer "./reg.txt"))) (if (and b (not (buffer-file-name b))) t nil))' 2>/dev/null)
+    if [ "$wbuf" = "t" ]; then
+      pass "-w forces write mode for a path-shaped buffer name"
+    else
+      fail "-w escape hatch broken"
+    fi
+    cleanup_buffer "./reg.txt"
+
+    # Ambiguous mixed positionals demand an explicit mode
+    rc=0
+    output=$($SCRIPT "$OPEN_TEST_DIR/plain.txt" "*not-a-path*" </dev/null 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && [[ "$output" == *"disambiguate"* ]]; then
+      pass "Mixed path/non-path positionals rejected without explicit mode"
+    else
+      fail "Mixed positionals not rejected: rc=$rc output='$output'"
+    fi
+  fi
+fi
+
+# Test 23: Option parsing guards
+section "Test 16.2: Option Parsing Guards"
+if should_run_test "core"; then
+  if [ "$LIST_TESTS" = true ]; then
+    echo "  [core] Missing operands and conflicting mode flags"
+  else
+    rc=0
+    output=$($SCRIPT -f </dev/null 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && [[ "$output" == *"requires an argument"* ]] && [[ "$output" != *"unbound"* ]]; then
+      pass "-f without operand yields usage error"
+    else
+      fail "-f without operand: rc=$rc output='$output'"
+    fi
+
+    rc=0
+    output=$($SCRIPT -s </dev/null 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && [[ "$output" == *"requires an argument"* ]] && [[ "$output" != *"unbound"* ]]; then
+      pass "-s without operand yields usage error"
+    else
+      fail "-s without operand: rc=$rc output='$output'"
+    fi
+
+    rc=0
+    output=$($SCRIPT -o -w x </dev/null 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && [[ "$output" == *"Conflicting mode flags"* ]]; then
+      pass "Conflicting mode flags rejected"
+    else
+      fail "Conflicting mode flags: rc=$rc output='$output'"
+    fi
+
+    rc=0
+    output=$(echo x | $SCRIPT -r 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && [[ "$output" == *"required for reading"* ]]; then
+      pass "-r without a pattern yields usage error"
+    else
+      fail "-r without pattern: rc=$rc output='$output'"
+    fi
+  fi
+fi
+
+# Test 24: tty mode-detection matrix (pty via script(1))
+section "Test 17: Smart Detection (tty)"
+if should_run_test "open,terminal"; then
+  if [ "$LIST_TESTS" = true ]; then
+    echo "  [open,terminal] tty detection: buffer read, file open, dired, no-args"
+  else
+    ensure_open_test_dir
+
+    # tty + buffer name -> read
+    cleanup_buffer "*my-test-buffer*"
+    echo "buffer content" | $SCRIPT "*my-test-buffer*" &>/dev/null
+    output=$(run_on_tty "$SCRIPT" "*my-test-buffer*" || true)
+    if [[ "$output" == *"buffer content"* ]]; then
+      pass "tty + buffer name reads the buffer"
+    else
+      fail "tty buffer-name detection failed: got '$output'"
+    fi
+    cleanup_buffer "*my-test-buffer*"
+
+    # tty + file path -> open
+    touch "$OPEN_TEST_DIR/ttyfile.txt"
+    run_on_tty "$SCRIPT" "$OPEN_TEST_DIR/ttyfile.txt" >/dev/null || true
+    if file_buffer_exists "$OPEN_TEST_DIR/ttyfile.txt"; then
+      pass "tty + file path opens the file"
+    else
+      fail "tty file-path detection failed"
+    fi
+
+    # tty + . -> dired
+    (cd "$OPEN_TEST_DIR" && run_on_tty "$SCRIPT_ABS" . >/dev/null) || true
+    if dired_buffer_exists "$OPEN_TEST_DIR"; then
+      pass "tty + . opens dired"
+    else
+      fail "tty dired detection failed"
+    fi
+
+    # tty + no args -> usage error
+    rc=0
+    output=$(run_on_tty "$SCRIPT") || rc=$?
+    if [[ "$output" == *"No input provided"* ]]; then
+      pass "tty + no args shows usage error"
+    else
+      fail "tty no-args error missing: got '$output'"
+    fi
+  fi
+fi
+
+# Test 25: bulk open through forced xargs batching
+section "Test 17.1: Bulk Open via xargs Batches"
+if should_run_test "open,large"; then
+  if [ "$LIST_TESTS" = true ]; then
+    echo "  [open,large] 300 files (spaces in names) via xargs -0 -n 100"
+  else
+    ensure_open_test_dir
+    batch_dir="$OPEN_TEST_DIR/batch"
+    mkdir -p "$batch_dir"
+    for i in $(seq 1 300); do
+      : > "$batch_dir/bulk file $i.txt"
+    done
+
+    find "$batch_dir" -name '*.txt' -print0 | xargs -0 -n 100 "$SCRIPT" --open || true
+
+    count=$(emacsclient --eval "(let ((n 0))
+      (dolist (b (buffer-list) n)
+        (let ((f (buffer-file-name b)))
+          (when (and f (string-prefix-p \"$batch_dir/\" f))
+            (setq n (1+ n))))))" 2>/dev/null)
+    if [ "$count" = "300" ]; then
+      pass "300 spaced filenames opened across 3 xargs batches"
+    else
+      fail "Bulk open: expected 300 buffers, got '$count'"
+    fi
+
+    # Kill the bulk buffers promptly instead of waiting for the EXIT trap
+    emacsclient --eval "(let ((kill-buffer-query-functions nil))
+      (dolist (b (buffer-list))
+        (let ((f (buffer-file-name b)))
+          (when (and f (string-prefix-p \"$batch_dir/\" f))
+            (kill-buffer b)))))" &>/dev/null || true
+  fi
 fi
 
 # Test 23: Large buffer reading
@@ -598,6 +915,71 @@ if [ "$before" -eq "$after" ]; then
   pass "No temp files left behind"
 else
   fail "Temp files not cleaned up: before=$before, after=$after"
+fi
+
+# Test 26: self-update against fake file:// remotes - no network, no daemon
+section "Test 21: Self-update (hermetic)"
+if should_run_test "core"; then
+  if [ "$LIST_TESTS" = true ]; then
+    echo "  [core] self-update: install, symlink, downgrade refusal, format guard"
+  else
+    UPD_TEST_DIR=$(mktemp -d /tmp/mxp-update-test.XXXXXX)
+
+    # Fake remotes derived from the real script
+    sed 's/^VERSION="[0-9.]*"/VERSION="99.0.0"/' "$SCRIPT_ABS" > "$UPD_TEST_DIR/remote-newer"
+    sed 's/^VERSION="[0-9.]*"/VERSION="0.0.1"/' "$SCRIPT_ABS" > "$UPD_TEST_DIR/remote-older"
+    printf '#!/usr/bin/env bash\nVERSION="banana"\n' > "$UPD_TEST_DIR/remote-garbage"
+
+    # Newer remote installs; backup appears; exec bit survives
+    cp "$SCRIPT_ABS" "$UPD_TEST_DIR/mxp-copy" && chmod +x "$UPD_TEST_DIR/mxp-copy"
+    MXP_UPDATE_URL="file://$UPD_TEST_DIR/remote-newer" "$UPD_TEST_DIR/mxp-copy" --update </dev/null >/dev/null 2>&1 || true
+    if [ -x "$UPD_TEST_DIR/mxp-copy" ] &&
+        [[ "$("$UPD_TEST_DIR/mxp-copy" --version 2>/dev/null)" == *"99.0.0"* ]] &&
+        [ -f "$UPD_TEST_DIR/mxp-copy.backup" ]; then
+      pass "--update installs newer remote (backup kept, exec bit intact)"
+    else
+      fail "--update install path broken"
+    fi
+
+    # Updating through a symlink rewrites the target, keeps the link
+    cp "$SCRIPT_ABS" "$UPD_TEST_DIR/real-mxp" && chmod +x "$UPD_TEST_DIR/real-mxp"
+    ln -s "$UPD_TEST_DIR/real-mxp" "$UPD_TEST_DIR/link-mxp"
+    MXP_UPDATE_URL="file://$UPD_TEST_DIR/remote-newer" "$UPD_TEST_DIR/link-mxp" --update </dev/null >/dev/null 2>&1 || true
+    if [ -L "$UPD_TEST_DIR/link-mxp" ] &&
+        [[ "$("$UPD_TEST_DIR/real-mxp" --version 2>/dev/null)" == *"99.0.0"* ]]; then
+      pass "--update through a symlink rewrites the target, not the link"
+    else
+      fail "--update symlink resolution broken"
+    fi
+
+    # Older remote is refused, local version stays
+    rc=0
+    output=$(MXP_UPDATE_URL="file://$UPD_TEST_DIR/remote-older" "$UPD_TEST_DIR/mxp-copy" --update </dev/null 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ] && [[ "$output" == *"not downgrading"* ]] &&
+        [[ "$("$UPD_TEST_DIR/mxp-copy" --version 2>/dev/null)" == *"99.0.0"* ]]; then
+      pass "--update refuses to downgrade"
+    else
+      fail "--update downgrade guard broken: rc=$rc output='$output'"
+    fi
+
+    # Same version reports up to date (copy is 99.0.0 after first test)
+    output=$(MXP_UPDATE_URL="file://$UPD_TEST_DIR/remote-newer" "$UPD_TEST_DIR/mxp-copy" --update </dev/null 2>&1 || true)
+    if [[ "$output" == *"Already up to date"* ]]; then
+      pass "--update detects up-to-date version"
+    else
+      fail "--update up-to-date detection broken: got '$output'"
+    fi
+
+    # Nonsense remote version dies loudly, local untouched
+    rc=0
+    output=$(MXP_UPDATE_URL="file://$UPD_TEST_DIR/remote-garbage" "$UPD_TEST_DIR/mxp-copy" --update </dev/null 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && [[ "$output" == *"Unexpected remote version format"* ]] &&
+        [[ "$("$UPD_TEST_DIR/mxp-copy" --version 2>/dev/null)" == *"99.0.0"* ]]; then
+      pass "--update rejects malformed remote version"
+    else
+      fail "--update format guard broken: rc=$rc output='$output'"
+    fi
+  fi
 fi
 
 # --- Socket Transport Tests ---

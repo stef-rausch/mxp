@@ -14,6 +14,7 @@ Pipe content between your terminal and Emacs buffers - seamlessly bridge your co
 
 - *Write mode*: Pipe stdin to Emacs buffers (creates new or appends to existing)
 - *Read mode*: Output buffer content to stdout for piping
+- *Open mode*: Open files and directories (any number of them) in your running Emacs
 - *Streaming*: Real-time content updates with chunked processing
 - *Buffer matching*: Use exact names or regex patterns to find buffers
 - *Auto-generation*: Creates ~*Piper 1*~, ~*Piper 2*~, etc. when no name specified
@@ -141,7 +142,24 @@ mxp /path/to/directory
 
 # Works with relative paths
 mxp ../other-project/file.txt
+
+# Open several things at once (a single emacsclient call)
+mxp --open notes.org "file with spaces.org" src/
 #+end_src
+
+Open mode works the same when stdin is not a terminal, which makes it composable with ~xargs~ and ~find~. Every file lands in your one running Emacs - unlike ~xargs emacs~, which spawns a fresh instance per batch and trips over filenames with spaces:
+
+#+begin_src shell
+# Open every file that matches a search
+rg -l0 "TODO" -g '*.org' | xargs -0 mxp --open
+
+# Same via find
+find . -name '*.org' -exec mxp --open {} +
+#+end_src
+
+How the mode is chosen: explicit flags (~-o~ / ~-r~ / ~-w~ / ~-f~) always win; otherwise arguments that all exist on the filesystem are opened, piped stdin or not; otherwise, on a terminal, path-shaped arguments (starting with a slash, tilde or dot, or containing a slash) are opened while a bare word reads that buffer; otherwise piped stdin writes to the buffer, so regex buffer names like ~".*log.*"~ keep working in pipes. To pipe into a buffer whose name collides with an existing file, be explicit: ~cat data | mxp -w my-notes~.
+
+Open mode is silent on success. Missing paths are reported to stderr, the remaining ones still open, and the exit code is nonzero.
 
 *** Pipe command output into Emacs
 
